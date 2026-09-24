@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# Large dataset files (too big for GitHub)
+student_resource/dataset/
+student_resource/.DS_Store
