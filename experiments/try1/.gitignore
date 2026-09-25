@@ -1,0 +1,6 @@
+# generated artifacts — regenerate locally, never commit
+cache/
+model/
+output/*.tsv
+__pycache__/
+*.pyc
