@@ -45,6 +45,11 @@ def family_pc(fi: int, cache_dir: Path, split: str):
     """
     tdir = cache_dir / "trace_keys"
     kdir = cache_dir / "pool_keys"
+    # family not in this pool's key generation (old pool, new scripts):
+    # contribute nothing instead of crashing on a missing file.
+    if not all((kdir / f"{split}_f{fi}_s{s}_keys.npy").is_file()
+               for s in (1, 2, 3)):
+        return [np.empty(0, np.int64), np.empty(0, np.int64)]
 
     def uc(s: int):
         up = tdir / f"{split}_f{fi}_s{s}_u.npy"

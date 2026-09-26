@@ -126,7 +126,7 @@ def trace_chunk(task) -> dict:
     cd = Path(cache_dir)
     caches = {i: N.SourceCache(cd / f"{split}_source{i}") for i in (1, 2, 3)}
     u_arrs = {}
-    for fi in range(len(FAMILIES)):
+    for fi in active:
         for s in (1, 2, 3):
             u = np.load(u_paths[fi][s - 1][0], mmap_mode="r")
             c = np.load(u_paths[fi][s - 1][1], mmap_mode="r")
@@ -280,9 +280,16 @@ def main() -> None:
     kdir = cd / "pool_keys"
     tdir = cd / "trace_keys"
     tdir.mkdir(exist_ok=True)
-    u_paths = []
+    u_paths = {}
     active = []
     for fi in range(len(FAMILIES)):
+        # a family with no key files is not part of this pool's key
+        # generation (e.g. tracing an old 8-family pool with
+        # KEY_VERSION-2 scripts) — skip it entirely, BEFORE touching disk.
+        kfiles = [kdir / f"{args.split}_f{fi}_s{s}_keys.npy"
+                  for s in (1, 2, 3)]
+        if not all(k.is_file() for k in kfiles):
+            continue
         row = []
         for s in (1, 2, 3):
             up = tdir / f"{args.split}_f{fi}_s{s}_u.npy"
@@ -294,13 +301,8 @@ def main() -> None:
                 np.save(up, u)
                 np.save(cp_, c)
             row.append((up, cp_))
-        # a family with no key files = not in this pool's key generation
-        # (e.g. tracing an old 8-family pool with KEY_VERSION 2 scripts);
-        # its keys are skipped, matching the pool that actually exists.
-        kfiles = [kdir / f"{args.split}_f{fi}_s{s}_keys.npy" for s in (1, 2, 3)]
-        if all(k.is_file() for k in kfiles):
-            active.append(fi)
-            u_paths.append(row)
+        active.append(fi)
+        u_paths[fi] = row
     if len(active) < len(FAMILIES):
         print(f"[trace] NOTE: only families "
               f"{[FAMILIES[fi] for fi in active]} have key files "
