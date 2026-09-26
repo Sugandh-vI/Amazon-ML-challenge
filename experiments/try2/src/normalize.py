@@ -285,6 +285,17 @@ def _get_sanscript():
             _SANSCRIPT = False
     return _SANSCRIPT
 
+
+def _translit_backend() -> str:
+    """Stamped into cache meta; a change invalidates caches (translit differs)."""
+    try:
+        if not _get_sanscript():
+            return "none"
+        from importlib.metadata import version
+        return "indic-transliteration-" + version("indic-transliteration")
+    except Exception:
+        return "sanscript-unknown"
+
 _SCRIPT_TO_SANSCRIPT = {
     "devanagari": "DEVANAGARI", "bengali": "BENGALI", "gurmukhi": "GURMUKHI",
     "gujarati": "GUJARATI", "oriya": "ORIYA", "tamil": "TAMIL",
@@ -561,7 +572,8 @@ def ensure_cache(split: str, dataset: Path, cache_dir: Path,
         if meta_path.is_file() and not force and limit is None:
             meta = json.loads(meta_path.read_text())
             if (meta.get("src_size") == src.stat().st_size
-                    and meta.get("widths") == current_widths):
+                    and meta.get("widths") == current_widths
+                    and meta.get("translit_backend") == _translit_backend()):
                 out[stem] = cache_dir / stem
                 continue
         if not src.is_file():
@@ -603,6 +615,7 @@ def ensure_cache(split: str, dataset: Path, cache_dir: Path,
         meta = {
             "rows": i,
             "src_size": src.stat().st_size,
+            "translit_backend": _translit_backend(),
             "widths": current_widths,
             "truncated": {k: v for k, v in trunc.items() if v},
             "stem": stem,

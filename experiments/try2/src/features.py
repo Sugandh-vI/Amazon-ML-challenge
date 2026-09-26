@@ -122,6 +122,74 @@ def compute_cheap_scores(cache1: N.SourceCache, c2: N.SourceCache,
                               inter / float(min(len(sa), len(sb))))
     return out
 
+def _jac_contain(x: str, y: str):
+    """(jaccard, containment) over whitespace token sets; (0,0) if either empty."""
+    ta, tb = x.split(), y.split()
+    if not ta or not tb:
+        return 0.0, 0.0
+    sa, sb = set(ta), set(tb)
+    inter = len(sa & sb)
+    if inter == 0:
+        return 0.0, 0.0
+    return (inter / float(len(sa | sb)),
+            inter / float(min(len(sa), len(sb))))
+
+
+def compute_cheap_scores_v2(cache1: N.SourceCache, c2: N.SourceCache,
+                            c3: N.SourceCache, s1_ents: np.ndarray,
+                            other_ents: np.ndarray):
+    """Lexicographic ranker inputs -> (primary, secondary) float32.
+
+    primary   = max(jaccard(name_sorted), jaccard(name_translit)) where the
+                counterpart row is non-Latin (native script never overlaps
+                Latin tokens, so without this cross-script pairs score 0).
+    secondary = containment, same max-with-translit treatment — used ONLY to
+                break primary ties (Phase 0 showed max(jaccard, containment)
+                lets subset-names saturate at 1.0 and bury true pairs among
+                ties).
+    """
+    n = len(s1_ents)
+    pri = np.zeros(n, np.float32)
+    sec = np.zeros(n, np.float32)
+    if n == 0:
+        return pri, sec
+    for lo in range(0, n, CHUNK):
+        hi = min(lo + CHUNK, n)
+        r1 = cache1.row_of(s1_ents[lo:hi])
+        r2, is3 = _other_rows(other_ents[lo:hi], c2, c3)
+        r1s = np.maximum(r1, 0)
+        r2s = np.maximum(r2, 0)
+        a = _gather_str(cache1, "name_sorted", r1s)
+        b2 = _gather_str(c2, "name_sorted", np.where(is3, 0, r2s))
+        b3 = _gather_str(c3, "name_sorted", np.where(is3, r2s, 0))
+        b = np.where(is3, b3, b2)
+        a = np.where(r1 < 0, "", a)
+        b = np.where(r2 < 0, "", b)
+        sc2 = c2.arrays["name_script"][np.where(is3, 0, r2s)]
+        sc3 = c3.arrays["name_script"][np.where(is3, r2s, 0)]
+        sc = np.where(is3, sc3, sc2)
+        sc = np.where(r2 < 0, 0, sc)
+        nonlat = sc != 0
+        if nonlat.any():
+            at = _gather_str(cache1, "name_translit", r1s)
+            bt2 = _gather_str(c2, "name_translit", np.where(is3, 0, r2s))
+            bt3 = _gather_str(c3, "name_translit", np.where(is3, r2s, 0))
+            bt = np.where(is3, bt3, bt2)
+            at = np.where(r1 < 0, "", at)
+            bt = np.where(r2 < 0, "", bt)
+        for i in range(hi - lo):
+            j, c = _jac_contain(a[i], b[i])
+            if nonlat[i]:
+                jt, ct = _jac_contain(at[i], bt[i])
+                if jt > j:
+                    j = jt
+                if ct > c:
+                    c = ct
+            pri[lo + i] = j
+            sec[lo + i] = c
+    return pri, sec
+
+
 def entity_aggs(s1_ids: np.ndarray, indptr: np.ndarray,
                 cheap: np.ndarray) -> Dict[str, np.ndarray]:
     """Per-candidate-list aggregates from cheap scores (CSR-aligned arrays)."""

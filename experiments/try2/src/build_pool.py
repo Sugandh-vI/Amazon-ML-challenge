@@ -45,7 +45,7 @@ import numpy as np
 
 import normalize as N
 from blocking import FAMILIES, pack_pairs
-from features import compute_cheap_scores
+from features import compute_cheap_scores_v2
 
 BIN_BITS = 17                    # s1 bins of 131072 ids
 BIG = 1 << 60                    # "infinite" budget for full materialization
@@ -226,7 +226,7 @@ def score_bin(task) -> dict:
     c1 = N.SourceCache(cd / f"{split}_source1")
     c2 = N.SourceCache(cd / f"{split}_source2")
     c3 = N.SourceCache(cd / f"{split}_source3")
-    cheap = compute_cheap_scores(c1, c2, c3, s1, ot)
+    pri, sec = compute_cheap_scores_v2(c1, c2, c3, s1, ot)
     rank = np.zeros(n, np.uint16)
     starts = np.flatnonzero(np.diff(s1)) + 1
     starts = np.concatenate(([0], starts, [n]))
@@ -235,15 +235,17 @@ def score_bin(task) -> dict:
         if hi - lo <= 1:
             rank[lo] = 0
             continue
-        order = np.argsort(-cheap[lo:hi], kind="stable")
+        # lexicographic: primary desc, secondary desc on ties
+        order = np.lexsort((-sec[lo:hi], -pri[lo:hi]))
         r = np.arange(hi - lo, dtype=np.uint32)
         rank[lo + order] = np.minimum(r, 65535).astype(np.uint16)
-    score_tmp = cd / f"{split}_pool_bin{b:02d}_score.f32.tmp"
-    rank_tmp = cd / f"{split}_pool_bin{b:02d}_rank.u16.tmp"
-    cheap.astype("<f4").tofile(score_tmp)
-    rank.astype("<u2").tofile(rank_tmp)
-    os.replace(score_tmp, cd / f"{split}_pool_bin{b:02d}_score.f32")
-    os.replace(rank_tmp, cd / f"{split}_pool_bin{b:02d}_rank.u16")
+    for arr, suffix in ((pri, "_score.f32"), (sec, "_score2.f32")):
+        tmp = cd / f"{split}_pool_bin{b:02d}{suffix}.tmp"
+        arr.astype("<f4").tofile(tmp)
+        os.replace(tmp, cd / f"{split}_pool_bin{b:02d}{suffix}")
+    rtmp = cd / f"{split}_pool_bin{b:02d}_rank.u16.tmp"
+    rank.astype("<u2").tofile(rtmp)
+    os.replace(rtmp, cd / f"{split}_pool_bin{b:02d}_rank.u16")
     return {"bin": b, "n": int(n), "s": round(time.time() - t0, 1)}
 
 
@@ -261,6 +263,8 @@ def main() -> None:
     ap.add_argument("--target-volume", type=int, default=500_000_000,
                     help="trim target when over threshold")
     ap.add_argument("--force", action="store_true", help="rebuild pool artifacts")
+    ap.add_argument("--rescore", action="store_true",
+                    help="redo stage D only (scores/ranks), keep stage A-C")
     args = ap.parse_args()
 
     workers = args.workers or min(3, _os.cpu_count() or 1)
@@ -309,8 +313,15 @@ def main() -> None:
           f"workers A={workers} D={score_workers}", flush=True)
 
     # ---- stage A --------------------------------------------------------
-    if all((args.cache_dir / f"{args.split}_stageA_fam{fi}.done").is_file()
-           for fi in range(len(FAMILIES))) and not args.force:
+    if args.rescore:
+        if not all((args.cache_dir / f"{args.split}_stageA_fam{fi}.done").is_file()
+                   for fi in range(len(FAMILIES))):
+            raise SystemExit("[pool] --rescore requires existing stage A-C; "
+                             "run build_pool without --rescore first")
+        print("[pool] --rescore: keeping stage A-C, redoing scores/ranks",
+              flush=True)
+    elif all((args.cache_dir / f"{args.split}_stageA_fam{fi}.done").is_file()
+             for fi in range(len(FAMILIES))) and not args.force:
         print("[pool] stage A: up to date", flush=True)
     else:
         print(f"[pool] stage A: materializing {len(FAMILIES)} families "
@@ -330,11 +341,17 @@ def main() -> None:
                       f"({r.get('elapsed_s', 0)}s)", flush=True)
         print(f"[pool] stage A done ({time.time()-t0:.0f}s)", flush=True)
 
-    # ---- stage B --------------------------------------------------------
-    scatter_stage_a(args.split, args.cache_dir, n_bins, args.force)
-
-    # ---- stage C --------------------------------------------------------
-    sizes = dedup_bins(args.split, args.cache_dir, n_bins, args.force)
+    # ---- stage B / C -----------------------------------------------------
+    if args.rescore:
+        marker = args.cache_dir / f"{args.split}_pool_dedup.done"
+        if not marker.is_file():
+            raise SystemExit("[pool] --rescore requires deduped pool")
+        sizes = [json.loads(marker.read_text())[str(b)] for b in range(n_bins)]
+        print(f"[pool] --rescore: reusing deduped pool ({sum(sizes):,} pairs)",
+              flush=True)
+    else:
+        scatter_stage_a(args.split, args.cache_dir, n_bins, args.force)
+        sizes = dedup_bins(args.split, args.cache_dir, n_bins, args.force)
     total_pool = sum(sizes)
     print(f"[pool] deduped pool total: {total_pool:,} pairs", flush=True)
 
@@ -343,8 +360,10 @@ def main() -> None:
             if not (args.cache_dir /
                     f"{args.split}_pool_bin{b:02d}_rank.u16").is_file()
             or not (args.cache_dir /
-                    f"{args.split}_pool_bin{b:02d}_score.f32").is_file()]
-    if args.force:
+                    f"{args.split}_pool_bin{b:02d}_score.f32").is_file()
+            or not (args.cache_dir /
+                    f"{args.split}_pool_bin{b:02d}_score2.f32").is_file()]
+    if args.force or args.rescore:
         todo = list(range(n_bins))
     if not todo:
         print("[pool] stage D: scores/ranks up to date", flush=True)
@@ -372,6 +391,7 @@ def main() -> None:
         "split": args.split,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "mode": mode,
+        "ranker": "lex-jaccard-translit-v2",
         "decision": {"post_cap_total": total_pc,
                      "max_volume": args.max_volume,
                      "target_volume": args.target_volume,
