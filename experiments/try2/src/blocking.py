@@ -53,7 +53,11 @@ import normalize as N
 from normalize import S3_OFFSET
 import features as F
 
-FAMILIES = ["sig", "pfx", "tok", "phon", "ini", "hn", "atok", "combo"]
+FAMILIES = ["sig", "pfx", "tok", "phon", "ini", "hn", "atok", "combo",
+            "hnstate", "atok2"]
+# bump whenever key emission changes -> count_families auto-rebuilds keys,
+# build_pool invalidates stage A via plan_sig (embeds KEY_VERSION).
+KEY_VERSION = 2
 
 # --------------------------------------------------------------------------
 # Stage A: key building
@@ -129,11 +133,24 @@ def build_all_keys(cache: N.SourceCache, s3: bool,
             add(5, hn)
             if core_toks and core_toks[0]:
                 add(7, hn + "|" + core_toks[0])
+            # KEY_VERSION 2: houseno|state — HN_AND_STATE was the largest
+            # stage-A-miss family (451k pairs); hn alone has bucket products
+            # 11k-623k (always capped); hn+state splits it into small buckets.
+            st = a["state"][i].decode("utf-8", "replace")
+            if st:
+                add(8, hn + "|" + st)
         at = a["addr_tokens"][i].decode("utf-8", "replace")
         if at:
-            for t in at.split():
+            toks = at.split()
+            for t in toks:
                 if len(t) >= 4 and t.isalpha() and t not in N.ADDR_STOP_TOKENS:
                     add(6, t)
+            # KEY_VERSION 2: adjacent addr-token bigrams — single atok tokens
+            # ('street','road',...) carried products up to billions and were
+            # the best family for 712k CAP victims; bigrams keep the pair,
+            # shrink the bucket.
+            for j in range(len(toks) - 1):
+                add(9, toks[j] + " " + toks[j + 1])
     return (np.asarray(keys, dtype=np.int64),
             np.asarray(ents, dtype=np.int64),
             np.asarray(fams, dtype=np.uint8))

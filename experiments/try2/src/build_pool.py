@@ -44,7 +44,7 @@ from pathlib import Path
 import numpy as np
 
 import normalize as N
-from blocking import FAMILIES, pack_pairs
+from blocking import FAMILIES, KEY_VERSION, pack_pairs
 from features import compute_cheap_scores_v2
 
 BIN_BITS = 17                    # s1 bins of 131072 ids
@@ -103,7 +103,8 @@ def expand_join_stream(k1, e1, k2, e2, per_key_cap, budget, emit,
 
 
 def materialize_family(fi: int, split: str, cache_dir: str,
-                       budgets: dict, per_key_cap: int, force: bool) -> dict:
+                       budgets: dict, per_key_cap: int, force: bool,
+                       plan_sig: str = "") -> dict:
     """Stage-A worker: join S1 x {S2,S3} for one family, append packed pairs."""
     cd = Path(cache_dir)
     kdir = cd / "pool_keys"
@@ -111,7 +112,8 @@ def materialize_family(fi: int, split: str, cache_dir: str,
     done = cd / f"{split}_stageA_fam{fi}.done"
     if out.is_file() and done.is_file() and not force:
         meta = json.loads(done.read_text())
-        if out.stat().st_size == meta.get("bytes", -1):
+        if (out.stat().st_size == meta.get("bytes", -1)
+                and meta.get("plan_sig") == plan_sig):
             return {"family": FAMILIES[fi], "skipped": True, **meta}
     t0 = time.time()
     k1 = np.load(kdir / f"{split}_f{fi}_s1_keys.npy", mmap_mode="r")
@@ -138,6 +140,7 @@ def materialize_family(fi: int, split: str, cache_dir: str,
     fh.close()
     os.replace(tmp, out)
     meta = {"family": FAMILIES[fi], "bytes": out.stat().st_size,
+            "plan_sig": plan_sig,
             "total_pairs": stats["total"], "cap_dropped_buckets": stats["cap"],
             "budget_dropped_buckets": stats["bud"],
             "s2_pairs": stats["s2"], "s3_pairs": stats["s3"],
@@ -214,6 +217,20 @@ def dedup_bins(split: str, cache_dir: Path, n_bins: int, force: bool) -> list:
 
 
 # ---------------------------------------------------------------- stage D
+_SC: dict = {}
+
+
+def _score_caches(split: str, cd: Path):
+    """Per-process SourceCache cache: workers score thousands of bins and
+    were re-opening all three caches on every call (measured: ~1-2s/bin of
+    pure setup, ~30-60 min over a full stage-D run)."""
+    k = (split, str(cd))
+    if k not in _SC:
+        _SC[k] = tuple(N.SourceCache(cd / f"{split}_source{i}")
+                       for i in (1, 2, 3))
+    return _SC[k]
+
+
 def score_bin(task) -> dict:
     b, split, dataset, cache_dir, n = task
     t0 = time.time()
@@ -223,9 +240,7 @@ def score_bin(task) -> dict:
     s1 = (p >> 33).astype(np.int64)
     ot = (p & ((1 << 33) - 1)).astype(np.int64)
     del p
-    c1 = N.SourceCache(cd / f"{split}_source1")
-    c2 = N.SourceCache(cd / f"{split}_source2")
-    c3 = N.SourceCache(cd / f"{split}_source3")
+    c1, c2, c3 = _score_caches(split, cd)
     pri, sec = compute_cheap_scores_v2(c1, c2, c3, s1, ot)
     rank = np.zeros(n, np.uint16)
     starts = np.flatnonzero(np.diff(s1)) + 1
@@ -255,9 +270,10 @@ def main() -> None:
     N.add_common_args(ap)
     ap.add_argument("--split", default="train", choices=["train", "test"])
     ap.add_argument("--workers", type=int, default=0,
-                    help="family workers (stage A); default min(3, cpus)")
+                    help="family workers (stage A); default min(4, cpus)")
     ap.add_argument("--score-workers", type=int, default=0,
-                    help="score workers (stage D); default min(3, cpus)")
+                    help="score workers (stage D); default min(6, cpus) — "
+                         "measured stage-D ETA ~3.3h @3w, ~1.7h @6w (M4)")
     ap.add_argument("--max-volume", type=int, default=600_000_000,
                     help="full-materialize threshold on post-cap pairs")
     ap.add_argument("--target-volume", type=int, default=500_000_000,
@@ -267,8 +283,8 @@ def main() -> None:
                     help="redo stage D only (scores/ranks), keep stage A-C")
     args = ap.parse_args()
 
-    workers = args.workers or min(3, _os.cpu_count() or 1)
-    score_workers = args.score_workers or min(3, _os.cpu_count() or 1)
+    workers = args.workers or min(4, _os.cpu_count() or 1)
+    score_workers = args.score_workers or min(6, _os.cpu_count() or 1)
     counts_path = args.cache_dir / f"{args.split}_blocking_counts.json"
     if not counts_path.is_file():
         raise SystemExit(f"[pool] missing {counts_path} — run count_families first")
@@ -313,15 +329,33 @@ def main() -> None:
           f"workers A={workers} D={score_workers}", flush=True)
 
     # ---- stage A --------------------------------------------------------
+    # phase-1 gate: counts must match current key emission + cap plan
+    if counts.get("key_version") != KEY_VERSION:
+        raise SystemExit(
+            f"[pool] counts key_version {counts.get('key_version')} != "
+            f"{KEY_VERSION} — re-run: python src/count_families.py "
+            f"--split {args.split} (it will rebuild keys automatically)")
+    caps = counts.get("family_caps") or {
+        fam: counts["per_key_cap"] for fam in FAMILIES}
+    plan_sig = f"v{KEY_VERSION}:" + json.dumps(caps, sort_keys=True)
+
+    def stage_a_current() -> bool:
+        for fi in range(len(FAMILIES)):
+            d = args.cache_dir / f"{args.split}_stageA_fam{fi}.done"
+            if not d.is_file() or json.loads(d.read_text()).get(
+                    "plan_sig") != plan_sig:
+                return False
+        return True
+
     if args.rescore:
-        if not all((args.cache_dir / f"{args.split}_stageA_fam{fi}.done").is_file()
-                   for fi in range(len(FAMILIES))):
-            raise SystemExit("[pool] --rescore requires existing stage A-C; "
-                             "run build_pool without --rescore first")
+        if not stage_a_current():
+            raise SystemExit(
+                "[pool] --rescore: stage A was built for different "
+                "keys/caps — run build_pool WITHOUT --rescore (stage A-C "
+                "will rebuild, then scores/ranks)")
         print("[pool] --rescore: keeping stage A-C, redoing scores/ranks",
               flush=True)
-    elif all((args.cache_dir / f"{args.split}_stageA_fam{fi}.done").is_file()
-             for fi in range(len(FAMILIES))) and not args.force:
+    elif stage_a_current() and not args.force:
         print("[pool] stage A: up to date", flush=True)
     else:
         print(f"[pool] stage A: materializing {len(FAMILIES)} families "
@@ -330,8 +364,9 @@ def main() -> None:
         with ProcessPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(materialize_family, fi, args.split,
                               str(args.cache_dir),
-                              budgets[FAMILIES[fi]], counts["per_key_cap"],
-                              args.force)
+                              budgets[FAMILIES[fi]],
+                              caps[FAMILIES[fi]],
+                              args.force, plan_sig)
                     for fi in range(len(FAMILIES))]
             for fut in as_completed(futs):
                 r = fut.result()
@@ -398,6 +433,9 @@ def main() -> None:
                      "scale": scale,
                      "budgets": budgets},
         "per_key_cap": counts["per_key_cap"],
+        "family_caps": caps,
+        "plan_sig": plan_sig,
+        "key_version": KEY_VERSION,
         "bin_bits": BIN_BITS,
         "s1_max": s1_max,
         "n_bins": n_bins,

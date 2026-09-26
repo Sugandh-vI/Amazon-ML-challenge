@@ -7,30 +7,42 @@ try1's blind 200M default after first *counting* true sizes).
 
 ## Phase 1 — measurement → evidence-driven fixes (current)
 
-Run from `experiments/try2/`, in this order (Steps 0–2 are pure measurement,
-run them before anything else; Step 3 must run AFTER 0–2 so the tracer sees
-the same key generation as the pool):
+Steps 0–4 are **shipped and measured** (real results: alignment clean, tracer
+CAP 99.72% / NOKEY 0.28% / BUG 0, cap curve, rescore delivered@80
+76.06→76.65%). Steps 5–6 below are the rest of Phase 1.
 
 ```bash
 export DS=../../student_resource/dataset
-pip install -r requirements.txt                       # includes indic-transliteration (MIT)
+pip install -r requirements.txt     # adds indic-transliteration (MIT), once
 
-python src/check_ranker.py   --dataset $DS            # Step 0  ~2-4 min
-python src/trace_misses.py   --split train --dataset $DS          # Step 1  ~5-8 min  (4 workers)
-python src/cap_curve.py      --split train --dataset $DS          # Step 2  ~4-6 min
-python src/enable_translit.py --split train --dataset $DS         # Step 3  ~3-4 min
-python src/build_pool.py     --split train --dataset $DS --rescore  # Step 4  ~8-10 min
+# ---- Step 5 cycle (ONE expensive rebuild; ~2-3 h, dominated by stage D) ----
+python src/trace_misses.py   --split train --dataset $DS   # ~1-2 min (updated: stamps best-family per victim)
+python src/cap_plan.py       --split train --dataset $DS   # ~1-2 min -> {split}_cap_plan.json (per-family caps)
+python src/count_families.py --split train --dataset $DS   # ~6-8 min; auto-rebuilds keys on KEY_VERSION bump, applies plan
+python src/build_pool.py     --split train --dataset $DS   # FULL run (never --rescore across a key/cap change);
+                                                           # stage-D ETA was 3.3 h @3 workers measured —
+                                                           # defaults now A=4 / D=6 (~1.7 h stage D)
+
+# ---- Step 6: gate + fresh measurement on the NEW pool ----
+python src/trace_misses.py   --split train --dataset $DS   # fresh classification (~1-2 min)
+python src/gate_check.py     --split train --dataset $DS   # ~60-90 s -> PASS/FAIL at 98% entity in-pool
 python src/analyze_misses.py --split train --dataset $DS --try1-cache ../try1/cache
+python src/cap_plan.py       --split train --dataset $DS   # residue report + seed for the next cycle
 ```
 
-Paste back: check_ranker verdict, `output/trace_report.txt`,
-`output/cap_curve.txt`, enable_translit verify block, and the re-run
-analyze decomposition/recall@K.
+Paste back: **gate output**, both `output/cap_plan.txt`, both tracer
+summaries, and the analyze decomposition + recall@K.
 
-**Gate:** no feature/train/tune changes until stage-A entity recall ≥98%.
-Step 5 (key changes) is chosen from the tracer output — it does not get
-finalized until the tracer has been reviewed. `build_pool --rescore` redoes
-scores/ranks only (stage A–C untouched); `--force` rebuilds everything.
+Mechanics worth knowing:
+- `KEY_VERSION` in `blocking.py` — bump on any emission change;
+  `count_families` auto-rebuilds keys when counts are stale, `build_pool`
+  refuses to run stage A against stale counts (`plan_sig` also invalidates
+  stage A whenever the cap plan changes).
+- `--rescore` only for score/rank changes on an UNCHANGED pool; it refuses
+  if keys or caps moved since stage A.
+- **Gate:** stage-A entity recall ≥98% (all GT pairs in pool, any rank)
+  before any feature/train/tune work. Cycles repeat (keys/caps) until it
+  passes, then Phase 2.
 
 ## Phase 0 — measurement (complete)
 

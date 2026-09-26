@@ -105,18 +105,24 @@ def row_family_keys(cache: N.SourceCache, row: int, s3: bool
         add(5, hn)
         if core_toks and core_toks[0]:
             add(7, hn + "|" + core_toks[0])
+        st = a["state"][row].decode("utf-8", "replace")
+        if st:
+            add(8, hn + "|" + st)
     at = a["addr_tokens"][row].decode("utf-8", "replace")
     if at:
-        for t in at.split():
+        toks = at.split()
+        for t in toks:
             if len(t) >= 4 and t.isalpha() and t not in N.ADDR_STOP_TOKENS:
                 add(6, t)
+        for j in range(len(toks) - 1):
+            add(9, toks[j] + " " + toks[j + 1])
     return out
 
 
 # ---------------------------------------------------------------- worker
 def trace_chunk(task) -> dict:
     (split, cache_dir, r1, roth, is3, s1_ids, ot_ids, per_key_cap,
-     u_paths) = task
+     u_paths, active) = task
     cd = Path(cache_dir)
     caches = {i: N.SourceCache(cd / f"{split}_source{i}") for i in (1, 2, 3)}
     u_arrs = {}
@@ -137,7 +143,7 @@ def trace_chunk(task) -> dict:
     cap_hist = Counter()
     nokey_matrix = np.zeros((len(FAMILIES), len(NOKEY_COLS)), np.int64)
     cap_family = Counter()
-    capv_packed, capv_pc = [], []
+    capv_packed, capv_pc, capv_fam = [], [], []
     examples = {"BUG": [], "CAP": [], "NOKEY": []}
     for j in range(len(r1)):
         row1 = int(r1[j])
@@ -152,7 +158,7 @@ def trace_chunk(task) -> dict:
         best_pc = None
         best_fam = None
         shared_any = False
-        for fi in range(len(FAMILIES)):
+        for fi in active:
             keys1 = dict(k1[fi])
             keyso = dict(ko[fi])
             shared = set(keys1) & set(keyso)
@@ -185,6 +191,7 @@ def trace_chunk(task) -> dict:
                     break
             capv_packed.append((int(s1_ids[j]) << 33) | int(ot_ids[j]))
             capv_pc.append(int(best_pc))
+            capv_fam.append(int(best_fam))
             if len(examples["CAP"]) < 40:
                 examples["CAP"].append(
                     {"s1": int(s1_ids[j]), "oth": int(ot_ids[j]),
@@ -192,7 +199,7 @@ def trace_chunk(task) -> dict:
                      "bucket_pairs": int(best_pc)})
         else:
             reasons["NOKEY"] += 1
-            for fi in range(len(FAMILIES)):
+            for fi in active:
                 e1 = len(k1[fi]) > 0
                 eo = len(ko[fi]) > 0
                 if e1 and not eo:
@@ -213,6 +220,7 @@ def trace_chunk(task) -> dict:
             "nokey_matrix": nokey_matrix,
             "capv_packed": np.asarray(capv_packed, np.int64),
             "capv_pc": np.asarray(capv_pc, np.int64),
+            "capv_fam": np.asarray(capv_fam, np.uint8),
             "examples": examples}
 
 
@@ -273,6 +281,7 @@ def main() -> None:
     tdir = cd / "trace_keys"
     tdir.mkdir(exist_ok=True)
     u_paths = []
+    active = []
     for fi in range(len(FAMILIES)):
         row = []
         for s in (1, 2, 3):
@@ -285,7 +294,18 @@ def main() -> None:
                 np.save(up, u)
                 np.save(cp_, c)
             row.append((up, cp_))
-        u_paths.append(row)
+        # a family with no key files = not in this pool's key generation
+        # (e.g. tracing an old 8-family pool with KEY_VERSION 2 scripts);
+        # its keys are skipped, matching the pool that actually exists.
+        kfiles = [kdir / f"{args.split}_f{fi}_s{s}_keys.npy" for s in (1, 2, 3)]
+        if all(k.is_file() for k in kfiles):
+            active.append(fi)
+            u_paths.append(row)
+    if len(active) < len(FAMILIES):
+        print(f"[trace] NOTE: only families "
+              f"{[FAMILIES[fi] for fi in active]} have key files "
+              f"(pool built pre-KEY_VERSION-2?) — the rest are inactive",
+              flush=True)
     print(f"[trace] key-count arrays ready ({time.time()-t0:.0f}s)", flush=True)
 
     # ---- row maps for misses ----
@@ -314,10 +334,10 @@ def main() -> None:
         if sl.start == sl.stop:
             continue
         tasks.append((args.split, str(cd), r1[sl], roth[sl], ~m2[sl],
-                      s1_ids[sl], ot_ids[sl], cap, u_paths))
+                      s1_ids[sl], ot_ids[sl], cap, u_paths, active))
     agg_reasons, agg_hist, agg_fam = Counter(), Counter(), Counter()
     agg_mat = np.zeros((len(FAMILIES), len(NOKEY_COLS)), np.int64)
-    all_packed, all_pc = [], []
+    all_packed, all_pc, all_fam = [], [], []
     ex = {"BUG": [], "CAP": [], "NOKEY": []}
     with ProcessPoolExecutor(max_workers=workers) as pex:
         futs = [pex.submit(trace_chunk, t) for t in tasks]
@@ -330,6 +350,7 @@ def main() -> None:
             agg_mat += r["nokey_matrix"]
             all_packed.append(r["capv_packed"])
             all_pc.append(r["capv_pc"])
+            all_fam.append(r["capv_fam"])
             for k in ex:
                 room = 40 - len(ex[k])
                 if room > 0:
@@ -396,8 +417,10 @@ def main() -> None:
     packed = (np.concatenate(all_packed) if all_packed
               else np.empty(0, np.int64))
     pc = np.concatenate(all_pc) if all_pc else np.empty(0, np.int64)
+    fam = (np.concatenate(all_fam) if all_fam
+           else np.empty(0, np.uint8))
     np.savez(cd / f"{args.split}_trace.npz", capv_packed=packed,
-             capv_minpc=pc)
+             capv_minpc=pc, capv_fam=fam)
     summary = {"split": args.split, "per_key_cap": cap,
                "n_gt": int(len(p_gt)), "n_miss": int(n_miss),
                "reasons": dict(agg_reasons),

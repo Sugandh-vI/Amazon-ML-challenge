@@ -38,7 +38,7 @@ from typing import Optional
 import numpy as np
 
 import normalize as N
-from blocking import FAMILIES, build_all_keys
+from blocking import FAMILIES, KEY_VERSION, build_all_keys
 
 
 def _counts_after_selection(pc: np.ndarray, cap: int, budget: int) -> dict:
@@ -81,8 +81,12 @@ def _atomic_save(path: Path, arr: np.ndarray) -> None:
 
 def count_one_family(fi: int, split: str, dataset: str, cache_dir: str,
                      per_key_cap: int, side_budget: int,
-                     limit: Optional[int]) -> dict:
-    """Worker: build keys for one family (3 sides), count, cache keys to disk."""
+                     limit: Optional[int], reuse_keys: bool = False) -> dict:
+    """Worker: build keys for one family (3 sides), count, cache keys to disk.
+
+    reuse_keys=True loads cached key arrays instead of re-streaming sources
+    (used when only caps/plan changed — emission unchanged).
+    """
     t0 = time.time()
     cd = Path(cache_dir)
     kdir = cd / "pool_keys"
@@ -93,9 +97,15 @@ def count_one_family(fi: int, split: str, dataset: str, cache_dir: str,
     for side in (1, 2, 3):
         cache = N.SourceCache(cd / f"{split}_source{side}")
         rows[side] = cache.rows
-        k, e, _ = build_all_keys(cache, s3=(side == 3), only=fi)
-        _atomic_save(kdir / f"{split}_f{fi}_s{side}_keys.npy", k)
-        _atomic_save(kdir / f"{split}_f{fi}_s{side}_ents.npy", e)
+        kp = kdir / f"{split}_f{fi}_s{side}_keys.npy"
+        ep = kdir / f"{split}_f{fi}_s{side}_ents.npy"
+        if reuse_keys and kp.is_file() and ep.is_file():
+            k = np.load(kp, mmap_mode="r")
+            e = np.load(ep, mmap_mode="r")
+        else:
+            k, e, _ = build_all_keys(cache, s3=(side == 3), only=fi)
+            _atomic_save(kp, k)
+            _atomic_save(ep, e)
         u, c = np.unique(k, return_counts=True)
         sides[side] = (u, c)
         del k, e
@@ -136,22 +146,49 @@ def main() -> None:
     key_paths = [args.cache_dir / "pool_keys" /
                  f"{args.split}_f{fi}_s{s}_keys.npy"
                  for fi in range(len(FAMILIES)) for s in (1, 2, 3)]
-    if json_path.is_file() and all(p.is_file() for p in key_paths) and not args.force:
+
+    # ---- per-family caps from cap_plan (Phase 1 Step 5), if present ----
+    plan_path = args.cache_dir / f"{args.split}_cap_plan.json"
+    caps = {fam: args.per_key_cap for fam in FAMILIES}
+    plan = None
+    if plan_path.is_file():
+        plan = json.loads(plan_path.read_text())
+        for fam, c in plan["per_family_cap"].items():
+            if fam in caps:
+                caps[fam] = int(c)
+        print(f"[count] applying cap plan: {plan_path.name} -> "
+              + ", ".join(f"{f}={caps[f]:,}" for f in FAMILIES), flush=True)
+
+    existing = (json.loads(json_path.read_text())
+                if json_path.is_file() else None)
+    kv_ok = bool(existing) and existing.get("key_version") == KEY_VERSION
+    keys_ok = all(p.is_file() for p in key_paths)
+    reuse = keys_ok and kv_ok
+    caps_same = bool(existing) and existing.get("family_caps") == caps
+    if (existing and kv_ok and keys_ok and caps_same and not args.force):
         print(f"[count] {json_path.name} + all key files exist — skipping "
               f"(use --force to redo)")
-        data = json.loads(json_path.read_text())
-        _print_table(data)
+        _print_table(existing)
         return
+    if keys_ok and not kv_ok:
+        print(f"[count] key_version {existing.get('key_version') if existing else None}"
+              f" != {KEY_VERSION} (emission changed) — rebuilding keys",
+              flush=True)
+        reuse = False
+    elif existing and not caps_same:
+        print("[count] cap plan changed — recounting from cached keys",
+              flush=True)
 
     print(f"[count] families={len(FAMILIES)} workers={workers} "
-          f"per_key_cap={args.per_key_cap} try1_side_budget={side_budget:,}",
-          flush=True)
+          f"key_version={KEY_VERSION} reuse_keys={reuse} "
+          f"try1_side_budget={side_budget:,}", flush=True)
     t0 = time.time()
     results = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(count_one_family, fi, args.split, str(args.dataset),
-                          str(args.cache_dir), args.per_key_cap, side_budget,
-                          args.limit): fi for fi in range(len(FAMILIES))}
+                          str(args.cache_dir), caps[FAMILIES[fi]], side_budget,
+                          args.limit, reuse): fi
+                for fi in range(len(FAMILIES))}
         for fut in as_completed(futs):
             r = fut.result()
             results.append(r)
@@ -184,6 +221,9 @@ def main() -> None:
         "split": args.split,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "per_key_cap": args.per_key_cap,
+        "family_caps": caps,
+        "key_version": KEY_VERSION,
+        "cap_plan": plan_path.name if plan else None,
         "try1_side_budget": side_budget,
         "families": families,
         "totals": totals,
