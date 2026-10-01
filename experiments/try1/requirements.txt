@@ -1,0 +1,22 @@
+# try1 pipeline dependencies (Python 3.9 – 3.12)
+# Core — required by every script in src/
+numpy==1.26.4
+rapidfuzz==3.9.7
+lightgbm==4.4.0
+# Optional — ROC-AUC reporting in train.py (it degrades gracefully without)
+scikit-learn==1.5.0
+# Used only for ad-hoc analysis, not by src/
+pandas==2.2.2
+
+# ---------------------------------------------------------------------------
+# Optional: cross-script name keys (blocking sig/pfx/phon/ini for Indic rows).
+# NOT installed by default. Before adding, license-check the package: the
+# challenge requires the final model to be MIT/Apache-2.0, and your team must
+# be comfortable shipping it in requirements.txt. If omitted, normalize.py
+# degrades gracefully (transliteration disabled, raw+address/token bridging
+# still works) — the blocking report's non-Latin recall segment will show the
+# cost. Suggested candidate (verify license + version on your machine):
+# indic-transliteration==2.3.1
+#
+# If you are on Python 3.13, numpy 1.26 has no wheels — use numpy==2.1.x and
+# rebuild the cache (delete experiments/try1/cache/ first).

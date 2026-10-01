@@ -1,0 +1,10 @@
+# try2 pins — same core as try1 plus the Phase-1 transliteration dependency.
+numpy==1.26.4
+rapidfuzz==3.9.7
+lightgbm==4.4.0
+# Phase 1 — transliteration (license: MIT, verified against PyPI metadata)
+indic-transliteration==2.3.82
+# optional / later phases
+scikit-learn==1.5.0
+pandas==2.2.2
+# Python 3.13 note: numpy 1.26.4 has no 3.13 wheels; let pip pick numpy>=2
